@@ -449,7 +449,7 @@ class AppControlInfoStrategy(BaseProcessingStrategy):
 
             # Step 3: Merging control list
             merged_control_list = await self._collect_merged_control_list(
-                api_control_list, grounding_control_list
+                api_control_list, grounding_control_list, command_dispatcher
             )
             self.control_recorder.merged_controls_info = merged_control_list
             self.control_recorder.application_windows_info = application_window_info
