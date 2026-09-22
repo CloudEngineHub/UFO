@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -13,7 +14,9 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StreamableHttpTransport
 
+from ufo.agents.processors.schemas.target import TargetInfo, TargetKind
 from ufo.client.mcp.http_servers.mobile_mcp_server import (
+    MobileServerState,
     create_mobile_action_server,
     create_mobile_data_collection_server,
 )
@@ -176,6 +179,233 @@ def keyevent_subprocess(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     create_process = AsyncMock(return_value=process)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
     return create_process
+
+
+@pytest.fixture
+def mobile_state() -> Iterator[MobileServerState]:
+    state = MobileServerState()
+    state.invalidate_all()
+    try:
+        yield state
+    finally:
+        state.invalidate_all()
+
+
+@pytest.fixture
+def text_input_server(
+    keyevent_server: FastMCP, mobile_state: MobileServerState
+) -> FastMCP:
+    mobile_state.set_current_controls(
+        [
+            TargetInfo(
+                kind=TargetKind.CONTROL,
+                id="5",
+                name="Search",
+                type="EditText",
+                rect=[0, 0, 10, 10],
+            )
+        ]
+    )
+    return keyevent_server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, shell_argument",
+    [
+        ("hello", "hello"),
+        ("hello world", "hello%sworld"),
+        ("", "''"),
+        ("a;id", "'a;id'"),
+        ("a|id", "'a|id'"),
+        ("a||id", "'a||id'"),
+        ("a&id", "'a&id'"),
+        ("a&&id", "'a&&id'"),
+        ("a`id`", "'a`id`'"),
+        ("a$(id)", "'a$(id)'"),
+        ("a;toybox${IFS}id", "'a;toybox${IFS}id'"),
+        ("a\nid", "'a\nid'"),
+        ("a\rid", "'a\rid'"),
+        ("a\tid", "'a\tid'"),
+        ("a<input", "'a<input'"),
+        ("a>output", "'a>output'"),
+        ("a'b", "'a'\"'\"'b'"),
+        ('a"$(id)"', '\'a"$(id)"\''),
+        ("a\\", "'a\\'"),
+        ("*?[abc]", "'*?[abc]'"),
+    ],
+)
+async def test_type_text_preserves_literal_shell_argument(
+    text_input_server: FastMCP,
+    keyevent_subprocess: AsyncMock,
+    text: str,
+    shell_argument: str,
+) -> None:
+    async with Client(text_input_server) as client:
+        result = await client.call_tool(
+            "type_text", {"text": text, "control_id": "5", "control_name": "Search"}
+        )
+
+    assert result.data["success"] is True
+    arguments = keyevent_subprocess.call_args.args
+    assert arguments == ("test-adb", "shell", "input", "text", shell_argument)
+    assert shlex.split(" ".join(arguments[2:])) == [
+        "input", "text", text.replace(" ", "%s")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_type_text_rejects_nul_before_adb(
+    text_input_server: FastMCP, keyevent_subprocess: AsyncMock
+) -> None:
+    async with Client(text_input_server) as client:
+        result = await client.call_tool(
+            "type_text",
+            {"text": "a\x00b", "control_id": "5", "control_name": "Search"},
+        )
+
+    assert result.data["success"] is False
+    assert "invalid text" in result.data["error"].lower()
+    keyevent_subprocess.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "package_name",
+    [
+        "com.example;id",
+        "com.example|id",
+        "com.example||id",
+        "com.example&id",
+        "com.example&&id",
+        "com.example`id`",
+        "com.example$(id)",
+        "com.example;toybox${IFS}id",
+        "com.example\nid",
+        "com.example\rid",
+        "com.example\tid",
+        "com.example>output",
+        "com.example<input",
+        "com.example --other-option",
+        "'com.example'",
+        '"com.example"',
+        "com.example\\",
+        "com.example\x00",
+        "com.*",
+        "com.example\n",
+        " com.example",
+        "com.example ",
+        ".com.example",
+        "com..example",
+        "com.example.",
+        "-com.example",
+        "com.1example",
+        "com.ex\u0430mple",
+    ],
+)
+async def test_launch_app_rejects_invalid_package_before_adb(
+    keyevent_server: FastMCP, keyevent_subprocess: AsyncMock, package_name: str
+) -> None:
+    async with Client(keyevent_server) as client:
+        result = await client.call_tool("launch_app", {"package_name": package_name})
+
+    assert result.data["success"] is False
+    assert "invalid package name" in result.data["error"].lower()
+    keyevent_subprocess.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["cache", "search"])
+@pytest.mark.parametrize(
+    "package_name, valid",
+    [
+        ("com.android.settings", True),
+        ("com.Example_app2.Main", True),
+        ("android", True),
+        ("com.example;id", False),
+        ("com.example$(id)", False),
+        ("com.example --other-option", False),
+    ],
+)
+async def test_launch_app_validates_resolved_package(
+    keyevent_server: FastMCP,
+    keyevent_subprocess: AsyncMock,
+    mobile_state: MobileServerState,
+    source: str,
+    package_name: str,
+    valid: bool,
+) -> None:
+    if source == "cache":
+        mobile_state.set_installed_apps(
+            [
+                TargetInfo(
+                    kind=TargetKind.WINDOW,
+                    id="7",
+                    name="Display Name",
+                    type=package_name,
+                )
+            ]
+        )
+        arguments = {"package_name": "Display Name", "id": "7"}
+    else:
+        keyevent_subprocess.return_value.communicate.return_value = (
+            f"package:{package_name}\n".encode("utf-8"), b""
+        )
+        arguments = {"package_name": package_name.split(".")[0]}
+
+    async with Client(keyevent_server) as client:
+        result = await client.call_tool("launch_app", arguments)
+
+    if source == "search":
+        assert keyevent_subprocess.call_args_list[0].args == (
+            "test-adb", "shell", "pm", "list", "packages"
+        )
+    assert result.data["success"] is valid
+    assert keyevent_subprocess.await_count == (source == "search") + valid
+    if valid:
+        assert result.data["package_name"] == package_name
+        assert keyevent_subprocess.call_args.args == (
+            "test-adb", "shell", "monkey", "-p", package_name,
+            "-c", "android.intent.category.LAUNCHER", "1"
+        )
+        assert "warning" in result.data
+    else:
+        assert "invalid package name" in result.data["error"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "package_name", ["com.android.settings", "com.Example_app2.Main"]
+)
+async def test_launch_app_preserves_valid_package_arguments(
+    keyevent_server: FastMCP, keyevent_subprocess: AsyncMock, package_name: str
+) -> None:
+    async with Client(keyevent_server) as client:
+        result = await client.call_tool("launch_app", {"package_name": package_name})
+
+    assert result.data["success"] is True
+    assert result.data["package_name"] == package_name
+    keyevent_subprocess.assert_awaited_once_with(
+        "test-adb", "shell", "monkey", "-p", package_name,
+        "-c", "android.intent.category.LAUNCHER", "1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_authenticated_launch_app_rejects_injection_before_adb(
+    mobile_action_server: RunningMobileServer,
+) -> None:
+    transport = StreamableHttpTransport(mobile_action_server.url, auth=TEST_API_KEY)
+    async with Client(transport) as client:
+        result = await client.call_tool(
+            "launch_app", {"package_name": "com.example;id"}
+        )
+
+    assert result.data["success"] is False
+    assert "invalid package name" in result.data["error"].lower()
+    assert not mobile_action_server.marker.exists()
 
 
 @pytest.mark.asyncio
