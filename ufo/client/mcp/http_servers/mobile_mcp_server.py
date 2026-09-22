@@ -17,6 +17,7 @@ import base64
 import hmac
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -860,7 +861,7 @@ def create_mobile_action_server(
         text: Annotated[
             str,
             Field(
-                description="Text to input. Spaces and special characters are automatically escaped."
+                description="Text to input. Spaces use Android's %s encoding; shell metacharacters are quoted literally. NUL characters are not supported."
             ),
         ],
         control_id: Annotated[
@@ -900,8 +901,15 @@ def create_mobile_action_server(
         3. Call type_text with the control's id and name
         4. The tool will click the control, then type the text
 
-        Note: Spaces and special characters are automatically escaped for Android input.
+        Spaces are encoded as %s for Android input, and the text is quoted for
+        the device's POSIX shell. NUL characters are rejected before any action.
         """
+        if "\x00" in text:
+            return {
+                "success": False,
+                "error": "Invalid text: NUL characters are not supported.",
+            }
+
         try:
             messages = []
 
@@ -975,8 +983,7 @@ def create_mobile_action_server(
 
                 messages.append("Cleared existing text")
 
-            # Escape text for shell (replace spaces with %s)
-            escaped_text = text.replace(" ", "%s").replace("&", "\\&")
+            escaped_text = shlex.quote(text.replace(" ", "%s"))
 
             # Type the text
             proc = await asyncio.create_subprocess_exec(
@@ -1106,6 +1113,15 @@ def create_mobile_action_server(
                 warning = (
                     f"Resolved '{package_name}' to package '{actual_package_name}'"
                 )
+
+            if re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*",
+                actual_package_name,
+            ) is None:
+                return {
+                    "success": False,
+                    "error": "Invalid package name: expected dot-separated ASCII identifiers starting with a letter.",
+                }
 
             # Launch the app using package name
             proc = await asyncio.create_subprocess_exec(
